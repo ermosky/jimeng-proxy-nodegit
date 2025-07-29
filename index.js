@@ -183,6 +183,9 @@ function getBodySha(body) {
 
 // 处理来自 Supabase Edge Function 的图片生成请求
 app.post('/generate-image', async (req, res) => {
+    // 在这里添加 console.log，确认请求已到达代理服务
+    console.log('Vercel 代理服务已接收到 /generate-image 请求！'); 
+
     // 检查即梦 API 密钥是否已配置
     if (!JIMENG_ACCESS_KEY_ID || !JIMENG_SECRET_ACCESS_KEY) {
         console.error('即梦 API 密钥未在环境变量中配置。');
@@ -308,4 +311,7 @@ app.post('/generate-image', async (req, res) => {
 app.listen(PORT, () => {
     console.log(`Node.js 代理服务正在监听端口 ${PORT}`);
     console.log(`请确保在部署环境中设置了 JIMENG_ACCESS_KEY_ID 和 JIMENG_SECRET_ACCESS_KEY 环境变量。`);
+
+    // 在这里添加 console.log，确认服务已成功启动
+    console.log('Vercel 代理服务已成功启动并监听请求！'); 
 });
