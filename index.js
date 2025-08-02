@@ -179,12 +179,58 @@ function getBodySha(body) {
     return hash.digest('hex');
 }
 
+// --- Exponential Backoff Retry Function ---
+const MAX_RETRIES = 3;
+const INITIAL_RETRY_DELAY_MS = 500; // 0.5 seconds
+
+async function makeJimengRequestWithRetry(requestUrl, requestOptions, attempt = 1) {
+    try {
+        console.log(`[Retry] Attempt ${attempt}/${MAX_RETRIES}: Making request to Jimeng API at ${requestUrl}`);
+        const jimengResponse = await fetch(requestUrl, requestOptions);
+
+        if (!jimengResponse.ok) {
+            const errorText = await jimengResponse.text();
+            console.error(`[Retry] Jimeng API Error (Attempt ${attempt}): Status ${jimengResponse.status}, Response: ${errorText}`);
+
+            // Check for 429 (Too Many Requests) or other retryable errors if applicable
+            // For now, only retry on 429
+            if (jimengResponse.status === 429 && attempt < MAX_RETRIES) {
+                const delay = INITIAL_RETRY_DELAY_MS * Math.pow(2, attempt - 1);
+                console.log(`[Retry] Retrying in ${delay}ms due to 429 Too Many Requests... (Attempt ${attempt + 1}/${MAX_RETRIES})`);
+                await new Promise(resolve => setTimeout(resolve, delay));
+                return makeJimengRequestWithRetry(requestUrl, requestOptions, attempt + 1);
+            } else {
+                // Re-throw if not 429 or max retries reached
+                throw new Error(`Jimeng API call failed with status ${jimengResponse.status}: ${errorText}`);
+            }
+        }
+
+        const contentType = jimengResponse.headers.get('Content-Type');
+        if (!contentType || !contentType.includes('application/json')) {
+            const responseText = await jimengResponse.text();
+            console.error(`[Retry] Jimeng API returned non-JSON content (Attempt ${attempt}, Content-Type: ${contentType}): ${responseText}`);
+            throw new Error(`Jimeng API returned non-JSON content: ${responseText}`);
+        }
+
+        const result = await jimengResponse.json();
+        console.log(`[Retry] Jimeng API Response (Attempt ${attempt}):`, result);
+        return result;
+
+    } catch (error) {
+        console.error(`[Retry] Request failed (Attempt ${attempt}):`, error.message);
+        throw error; // Re-throw the error after logging
+    }
+}
+
+
 // --- 代理服务接口 ---
 
 // 处理来自 Supabase Edge Function 的图片生成请求
 app.post('/generate-image', async (req, res) => {
     // 在这里添加 console.log，确认请求已到达代理服务
+    console.log('--- Incoming Request ---');
     console.log('Vercel 代理服务已接收到 /generate-image 请求！'); 
+    console.log('Request Body:', JSON.stringify(req.body, null, 2));
 
     // 检查即梦 API 密钥是否已配置
     if (!JIMENG_ACCESS_KEY_ID || !JIMENG_SECRET_ACCESS_KEY) {
@@ -210,6 +256,7 @@ app.post('/generate-image', async (req, res) => {
             use_sr: true, // 默认开启超分
             return_url: true, // 官方示例中包含此项
         };
+        console.log('Constructed Jimeng API Request Body:', JSON.stringify(bodyParams, null, 2));
 
         const bodyString = JSON.stringify(bodyParams);
         const datetime = getDateTimeNow();
@@ -233,6 +280,7 @@ app.post('/generate-image', async (req, res) => {
             bodySha: getBodySha(bodyString),
             pathName: '/', // 即梦 API 的路径通常是根路径
         };
+        console.log('Signing Parameters:', JSON.stringify(signParams, null, 2));
 
         // 正规化 query object， 防止串化后出现 query 值为 undefined 情况
         for (const [key, val] of Object.entries(signParams.query)) {
@@ -242,9 +290,10 @@ app.post('/generate-image', async (req, res) => {
         }
 
         const authorization = sign(signParams);
+        console.log('Generated Authorization Header:', authorization);
 
-        // 发起对即梦 API 的实际请求
-        const jimengResponse = await fetch(
+        // 发起对即梦 API 的实际请求 (使用重试逻辑)
+        const jimengResult = await makeJimengRequestWithRetry(
             `${JIMENG_API_URL}/?${qs.stringify(signParams.query)}`,
             {
                 headers: {
@@ -256,54 +305,28 @@ app.post('/generate-image', async (req, res) => {
             }
         );
 
-        // 检查即梦 API 响应是否成功 (2xx 状态码)
-        if (!jimengResponse.ok) {
-            const errorText = await jimengResponse.text();
-            console.error('即梦 API 错误: 非2xx状态码', jimengResponse.status, errorText);
-            return res.status(jimengResponse.status).json({
-                error: '即梦 API 调用失败',
-                details: errorText,
-                status: jimengResponse.status
-            });
-        }
-
-        const contentType = jimengResponse.headers.get('Content-Type');
-        if (!contentType || !contentType.includes('application/json')) {
-            const responseText = await jimengResponse.text();
-            console.error('即梦 API 返回非JSON内容 (Content-Type:', contentType, '):', responseText);
-            return res.status(500).json({
-                error: '即梦 API 返回非JSON内容',
-                details: responseText,
-                status: jimengResponse.status
-            });
-        }
-
-        const result = await jimengResponse.json();
-        console.log('即梦 API 响应:', result);
-
         // 检查即梦 API 返回的业务错误
-        if (result.code !== 10000) { // 文档中成功状态码是10000
-            console.error('即梦 API 业务错误:', result.message);
-            return res.status(500).json({ error: result.message || '即梦 API 业务错误', details: result });
+        if (jimengResult.code !== 10000) { // 文档中成功状态码是10000
+            console.error('即梦 API 业务错误:', jimengResult.message, 'Details:', jimengResult);
+            return res.status(500).json({ error: jimengResult.message || '即梦 API 业务错误', details: jimengResult });
         }
 
         // 成功响应，根据文档从 image_urls 数组中获取第一个 URL
-        if (result.data && result.data.image_urls && result.data.image_urls.length > 0) {
-            return res.status(200).json({ success: true, imageUrl: result.data.image_urls[0] });
+        if (jimengResult.data && jimengResult.data.image_urls && jimengResult.data.image_urls.length > 0) {
+            const imageUrl = jimengResult.data.image_urls[0];
+            console.log('Successfully generated image URL:', imageUrl);
+            return res.status(200).json({ success: true, imageUrl: imageUrl });
         } else {
+            console.error('Jimeng API response did not contain image URL:', jimengResult);
             throw new Error('即梦 API 响应中未找到图片URL');
         }
 
     } catch (error) {
-        console.error('Node.js 代理服务错误:', error.message);
-        if (error.response) {
-            // 如果是即梦 API 返回的错误响应
-            console.error('即梦 API 错误响应:', error.response.data);
-            res.status(error.response.status).json(error.response.data);
-        } else {
-            // 其他内部错误
-            res.status(500).json({ error: '代理服务内部错误', details: error.message });
-        }
+        console.error('Node.js 代理服务内部错误:', error.message);
+        // 统一错误响应格式
+        res.status(500).json({ error: '代理服务内部错误', details: error.message });
+    } finally {
+        console.log('--- Request Processing Complete ---');
     }
 });
 
