@@ -180,7 +180,7 @@ function getBodySha(body) {
 }
 
 // --- Exponential Backoff Retry Function ---
-const MAX_RETRIES = 3;
+const MAX_RETRIES = 0;
 const INITIAL_RETRY_DELAY_MS = 500; // 0.5 seconds
 
 async function makeJimengRequestWithRetry(requestUrl, requestOptions, attempt = 1) {
